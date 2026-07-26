@@ -27,7 +27,7 @@ This application automates inbound lead qualification and outreach drafting usin
 ### Installation
 
 1. **Clone the repository:**
-   git clone https://github.com/comfyinnautica/peek-pro-lead-triage.git
+   git clone https://github.com/comfyinnautica/peek-pro-lead-triage
    cd peek-pro-lead-triage
 
 2. **Set up a virtual environment:**

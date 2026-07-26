@@ -4,14 +4,65 @@ import requests
 import pandas as pd
 import random
 import re
-import csv
-import io
 from datetime import datetime
 import streamlit as st
 from openai import OpenAI
 from dotenv import load_dotenv
 
+# ── Load Environment Variables ────────────────────────────────────────────────
 load_dotenv()
+
+# ── Key Sanitizer Guardrail ───────────────────────────────────────────────────
+def sanitize_api_key(key: str) -> str:
+    if not key:
+        return ""
+    clean_key = re.sub(r'[^\x00-\x7F]+', '', key)
+    return clean_key.strip().strip("'\"`’“”")
+
+# ── Layer 0: Zero-Token Spam, Gibberish & Code Detector ──────────────────────
+def is_gibberish_or_code(text: str) -> tuple[bool, str]:
+    if not text or not text.strip():
+        return False, ""
+
+    t = text.strip()
+
+    # 1. Code / Script / Markup Detection
+    code_patterns = [
+        r'function\s*\w*\s*\(', r'def\s+\w+\s*\(', r'import\s+\w+', r'class\s+\w+',
+        r'const\s+\w+\s*=', r'let\s+\w+\s*=', r'var\s+\w+\s*=', 
+        r'<[a-zA-Z]+[^>@]*>', # Matches HTML like <div> but ignores emails like <brian@airbnb.com>
+        r'public\s+static\s+void', r'console\.log', r'return\s+.*;', r'#include\s*<',
+        r'select\s+.*\s+from\s+', r'{\s*".*":\s*".*"\s*}'
+    ]
+    for p in code_patterns:
+        if re.search(p, t, re.IGNORECASE):
+            return True, "Code snippet / script syntax detected in input"
+
+    # 2. Keyboard Row Patterns (e.g. asdfgh, qwerty, zxcvbn)
+    mash_patterns = [r'asdfgh', r'qwerty', r'zxcvbn', r'123456', r'hjklmn', r'dfghjk']
+    for m in mash_patterns:
+        if re.search(m, t, re.IGNORECASE):
+            return True, "Keyboard mash pattern detected (e.g. 'asdf'/'qwerty')"
+
+    # 3. Repeated Character Spam (e.g. "aaaaa")
+    if re.search(r'(.)\1{4,}', t):
+        return True, "Repeated character pattern / spam detected"
+
+    # 4. Unusually long words without spaces or URLs
+    words = t.split()
+    for w in words:
+        if len(w) > 18 and not w.startswith(("http://", "https://", "mailto:")) and "@" not in w:
+            return True, "Unusually long string without spaces (keyboard mash)"
+
+    # 5. Vowel Ratio Check for text over 15 characters
+    letters = [c.lower() for c in t if c.isalpha()]
+    if len(letters) > 15:
+        vowels = [c for c in letters if c in 'aeiou']
+        vowel_ratio = len(vowels) / len(letters)
+        if vowel_ratio < 0.15 or vowel_ratio > 0.85:
+            return True, f"Abnormal vowel ratio ({vowel_ratio:.1%}) - likely gibberish"
+
+    return False, ""
 
 # ── Page Config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -62,6 +113,8 @@ if "flash_success" not in st.session_state:
     st.session_state["flash_success"] = None
 
 CORRECTIONS_FILE = "corrections.jsonl"
+BACKUP_APPROVED_FILE = "last_session_approved.csv"
+BACKUP_AUDIT_FILE = "last_session_audit.csv"
 
 # ── Comprehensive Global Countries List ───────────────────────────────────────
 ALL_COUNTRIES = [
@@ -121,12 +174,78 @@ def sanitize_lead_payload(lead: dict) -> dict:
             sanitized[k] = val_str
     return sanitized
 
+# ── Session Backup Engine ─────────────────────────────────────────────────────
+def save_session_backup(results_list: list):
+    if not results_list:
+        return
+    export_rows = []
+    for r in results_list:
+        lead = r["lead"]
+        fname = lead.get("first_name") or (lead.get("name", "").split()[0] if lead.get("name") else "N/A")
+        lname = lead.get("last_name") or (" ".join(lead.get("name", "").split()[1:]) if len(lead.get("name", "").split()) > 1 else "N/A")
+
+        export_rows.append({
+            "First Name": fname,
+            "Last Name": lname,
+            "Email": lead.get("email", "N/A"),
+            "Company": lead.get("company", "N/A"),
+            "Sales Volume Tier": lead.get("annual_sales_volume", "N/A"),
+            "Priority": r["stage1"].get("priority"),
+            "Persona": r["stage1"].get("persona"),
+            "A/B Variation Tested": r["variation"],
+            "Draft Gen Source": r["draft_source"],
+            "Draft Tokens Used": r.get("draft_tokens", 0),
+            "Apollo Status": r["apollo_status"],
+            "Human Edits Required": r["human_edited"],
+            "Review Status": r["review_status"],
+            "Final Action Route": r["final_next_step"],
+            "Final Email Draft": r["final_draft"],
+            "Reviewer Notes": r["reviewer_notes"],
+        })
+
+    export_df = pd.DataFrame(export_rows)
+    approved_df = export_df[export_df["Review Status"].str.startswith("APPROVED")]
+
+    export_df.to_csv(BACKUP_AUDIT_FILE, index=False)
+    approved_df.to_csv(BACKUP_APPROVED_FILE, index=False)
+
+# ── Instant Route Template Callback ─────────────────────────────────────────
+def update_route_template(idx: int):
+    selected_route = st.session_state[f"route_override_{idx}"]
+    item = st.session_state["triage_results"][idx]
+    item["final_next_step"] = selected_route
+    lead = item["lead"]
+    fname = lead.get('first_name') or lead.get('name') or 'there'
+
+    if selected_route == "Disqualify":
+        new_template = "Thank you for reaching out to Peek Pro. Based on your current setup, our platform is not a fit at this time."
+    elif selected_route == "Self-serve / PLG":
+        new_template = f"Hi {fname},\n\nThanks for your interest! The best way to explore Peek Pro is to sign up for our self-serve platform directly on our website."
+    elif selected_route == "Nurture":
+        new_template = f"Hi {fname},\n\nThanks for reaching out! We'd love to stay in touch and keep you updated with the latest news and features from Peek Pro as you grow."
+    elif selected_route == "Customer Support":
+        new_template = f"Hi {fname},\n\nI've routed your message to our technical support team. They will be in touch shortly to assist you."
+    elif selected_route == "Needs More Information":
+        new_template = f"Hi {fname},\n\nThanks for reaching out! To help route you to the right team, could you share a bit more about your typical monthly booking volume?"
+    elif selected_route == "Sales":
+        new_template = f"Hi {fname},\n\nThanks for your interest in Peek Pro! We'd love to learn more about your setup. When is a good time to connect next week?"
+    else:
+        new_template = item["final_draft"]
+
+    item["final_draft"] = new_template
+    st.session_state[f"draft_edit_{idx}"] = new_template
+    save_session_backup(st.session_state["triage_results"])
+
 # ── Intelligence-First Enrichment Guardrails ───────────────────────────────
 def should_enrich_lead(lead: dict) -> bool:
     if not lead.get("company") and not lead.get("email"):
         return False
 
-    high_volume_tiers = ["$150,000 to $1,500,000", "$1,500,000 to $4m", "More than $4m"]
+    high_volume_tiers = [
+        "150,000 USD to 1,500,000 USD", "$150,000 to $1,500,000",
+        "1,500,000 USD to 4m USD", "$1,500,000 to $4m",
+        "More than 4m USD", "More than $4m"
+    ]
     if lead.get("annual_sales_volume") in high_volume_tiers:
         return True
     if lead.get("competitor_software") in ["FareHarbor", "Xola", "Anchor", "Resmark"]:
@@ -135,7 +254,7 @@ def should_enrich_lead(lead: dict) -> bool:
     if not lead.get("annual_sales_volume") or not lead.get("competitor_software") or lead.get("competitor_software") == "Other / Unknown":
         return True
 
-    low_volume_tiers = ["New business / less than 1 year of sales", "less than $50,000"]
+    low_volume_tiers = ["New business / less than 1 year of sales", "less than 50,000 USD", "less than $50,000"]
     if lead.get("annual_sales_volume") in low_volume_tiers:
         return False
 
@@ -149,7 +268,8 @@ def clean_apollo_payload(enrichment_data: dict) -> dict:
     return clean
 
 def enrich_with_apollo(email: str, company: str, api_key: str) -> dict:
-    if not api_key:
+    clean_key = sanitize_api_key(api_key)
+    if not clean_key:
         return {}
 
     domain = email.split("@")[-1] if email and "@" in email else ""
@@ -158,9 +278,13 @@ def enrich_with_apollo(email: str, company: str, api_key: str) -> dict:
         domain = ""
 
     url = "https://api.apollo.io/v1/organizations/enrich"
-    headers = {"Cache-Control": "no-cache", "Content-Type": "application/json"}
-    payload = {"api_key": api_key}
+    headers = {
+        "Cache-Control": "no-cache",
+        "Content-Type": "application/json",
+        "X-Api-Key": clean_key  # 👈 Fixed: Passed as Header (Apollo Requirement)
+    }
 
+    payload = {}
     if domain:
         payload["domain"] = domain
     elif company:
@@ -187,17 +311,20 @@ with st.sidebar:
     st.title("⚙️ System Settings")
     st.divider()
 
+    raw_env_openai = os.environ.get("OPENAI_API_KEY", "")
+    raw_env_apollo = os.environ.get("APOLLO_API_KEY", "")
+
     with st.expander("🔑 API Keys & Integrations", expanded=False):
         openai_key = st.text_input(
             "OpenAI API Key",
             type="password",
-            value=os.environ.get("OPENAI_API_KEY", ""),
+            value=sanitize_api_key(raw_env_openai),
             help="Paste your OpenAI API key here. Required for AI triage.",
         )
         apollo_key = st.text_input(
             "Apollo API Key (Optional)",
             type="password",
-            value=os.environ.get("APOLLO_API_KEY", ""),
+            value=sanitize_api_key(raw_env_apollo),
             help="Enables smart tie-breaker enrichment for leads.",
         )
 
@@ -214,7 +341,7 @@ with st.sidebar:
                 label = queued_lead.get("name") or queued_lead.get("company") or queued_lead.get("channel", "Unknown Lead")
                 st.caption(f"**{i+1}.** {label}")
 
-        if st.button("🗑️ Clear Queue", use_container_width=True):
+        if st.button("🗑️ Clear Queue", width="stretch"):
             st.session_state["lead_queue"] = []
             st.rerun()
 
@@ -226,6 +353,38 @@ with st.sidebar:
         help="Injects real-time human context into the email drafts. Limited to 120 characters to preserve A/B test integrity.",
         max_chars=120
     )
+
+    st.divider()
+    st.subheader("💾 Session Recovery")
+    st.caption("Recover data from your last session if you accidentally close or refresh the app.")
+
+    has_backup = False
+    if os.path.exists(BACKUP_APPROVED_FILE) and os.path.getsize(BACKUP_APPROVED_FILE) > 0:
+        has_backup = True
+        with open(BACKUP_APPROVED_FILE, "rb") as f_app:
+            st.download_button(
+                "💾 Recover Approved Leads (CSV)",
+                data=f_app.read(),
+                file_name=f"recovered_approved_leads_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+                type="primary",
+                width="stretch"
+            )
+
+    if os.path.exists(BACKUP_AUDIT_FILE) and os.path.getsize(BACKUP_AUDIT_FILE) > 0:
+        has_backup = True
+        with open(BACKUP_AUDIT_FILE, "rb") as f_aud:
+            st.download_button(
+                "💾 Recover Full Audit Log (CSV)",
+                data=f_aud.read(),
+                file_name=f"recovered_audit_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+                type="secondary",
+                width="stretch"
+            )
+
+    if not has_backup:
+        st.caption("No previous session backup found.")
 
     st.divider()
 
@@ -265,7 +424,6 @@ with st.sidebar:
 st.title("🏔️ Peek Pro — Multi-Channel Lead Triage Engine")
 st.caption("AI-powered GTM lead scoring, A/B Testing templates, conditional enrichment & human review gate.")
 
-# Safely display and clear the persistent success message post-rerun
 if st.session_state["flash_success"]:
     st.success(st.session_state["flash_success"])
     st.session_state["flash_success"] = None
@@ -305,13 +463,21 @@ def run_stage_1_scoring(client: OpenAI, lead: dict) -> dict:
 You are a Senior Revenue Operations Analyst for Peek Pro (experiences booking platform).
 Evaluate the lead against Peek Pro's Ideal Customer Profile (ICP).
 
-STRICT GROUND TRUTH & GENERAL RULES:
+STRICT GROUND TRUTH & EXTRACTION RULES:
+- INFORMATION EXTRACTION (CRITICAL): If the lead input contains raw transcript or email text, explicitly extract any contact details present in the text:
+  * "extracted_first_name": First name string or null
+  * "extracted_last_name": Last name string or null
+  * "extracted_email": Email address string or null
+  * "extracted_company": Company name string or null
+  * "extracted_annual_sales_volume": Standardized volume string (must map to one of: "New business / less than 1 year of sales", "less than 50,000 USD", "50,000 USD to 150,000 USD", "150,000 USD to 1,500,000 USD", "1,500,000 USD to 4m USD", "More than 4m USD") or null
+  * "extracted_job_title": Title string or null
+  * "extracted_competitor": Software/POS name mentioned (e.g. Anchor, FareHarbor, Xola) or null
+
 - GENERAL RULE: Err on the safe side. It is preferable to assign "Unknown" to missing information. Never assume or infer; deduce only from facts.
-- INTENT OVERRIDE RULE (CRITICAL): If the `notes` clearly indicate they are a reporter, student, or vendor NOT looking to buy, route to "Disqualify". HOWEVER, do NOT disqualify based solely on an unusual job title (e.g., "Mayor", "Illusionist") if they express clear intent for booking software, mention conversion issues, or name a competitor. Intent trumps unusual titles.
+- INDUSTRY EXCLUSION RULE (CRITICAL): Peek Pro is ONLY for Tour, Activity, Rental, Museum, and Experience operators. If the notes, company name, or enrichment data indicate they sell physical goods (e.g., paper, printers, retail, ecommerce), B2B services, software, or are otherwise entirely outside the experiences industry, you MUST score them low and route to "Disqualify", regardless of how high their revenue or job title is. Industry fit is absolute.
+- INTENT OVERRIDE RULE (CRITICAL): If the `notes` or transcript clearly indicate they are a reporter, student, or vendor NOT looking to buy, route to "Disqualify". HOWEVER, do NOT disqualify based solely on an unusual job title (e.g., "Mayor", "Illusionist") if they express clear intent for booking software, mention conversion issues, or name a competitor. Intent trumps unusual titles.
 - URGENCY & COMPETITOR RULE (CRITICAL): If the lead explicitly expresses HIGH URGENCY (e.g., "need to switch this week") OR mentions using a direct competitor (FareHarbor, Xola, Anchor, Resmark), they MUST be routed to "Sales" and given "High" priority, completely overriding low sales volume or unusual titles.
 - FORMATTING RULE: NEVER use the '$' symbol for currency (e.g., write "150,000 USD" instead of "$150,000") to prevent UI rendering errors. 
-- Form fields directly submitted by the user (annual_sales_volume, notes, competitor) are GROUND TRUTH.
-- DO NOT assume or hallucinate competitors. ONLY list competitor displacement signals if explicitly stated.
 
 PERSONA RULE & JOB TITLE GUIDELINES:
 - Owner-Operator: Owner, Founder, CEO, President, Captain/Owner, Co-Founder.
@@ -325,6 +491,13 @@ ICP Scoring Rules:
 - Sales Volume < 50k or New Business = Lower score (1-5). Route to Self-serve / PLG or Nurture.
 
 Return strict JSON with these exact keys:
+- "extracted_first_name": string or null
+- "extracted_last_name": string or null
+- "extracted_email": string or null
+- "extracted_company": string or null
+- "extracted_annual_sales_volume": string or null
+- "extracted_job_title": string or null
+- "extracted_competitor": string or null
 - "fit_score": integer 1-10
 - "priority": "High", "Medium", or "Low"
 - "persona": One of ["Owner-Operator", "Ops Manager", "Multi-Location Director", "Marketing / Revenue Lead", "Unknown"]
@@ -333,6 +506,8 @@ Return strict JSON with these exact keys:
     "industry_fit", "business_model", "company_size", "pain_indicators", "booking_method", "growth_signals", "geo_market", "multi_channel", "tech_readiness"
 - "buying_signals": list of strings
 - "missing_info": list of strings
+- "green_flags": list of strings (highlight strong ICP matches, high intent, or competitors)
+- "red_flags": list of strings (highlight poor industry fit, low revenue, or disqualifying factors)
 - "recommended_next_step": One of ["Sales", "Self-serve / PLG", "Nurture", "Customer Support", "Disqualify", "Needs More Information"]
 - "explanation": 2 sentence summary justification for the score and route
 """
@@ -406,15 +581,10 @@ Keep the email concise (under 120 words).{few_shot_str}
         ]
     )
 
-    # --- Python Post-Processor (Bulletproof Sanitization) ---
     raw_text = response.choices[0].message.content.strip()
-
-    # 1. Scrub em/en dashes and replace with commas or standard hyphens
     clean_text = raw_text.replace("—", ", ").replace("–", "-")
-
-    # 2. Aggressively scrub common AI signature placeholders via Regex
     clean_text = re.sub(r"(?i)\n*(Best regards|Best|Sincerely|Cheers|Looking forward to hearing from you)[,\s]*\n*.*", "", clean_text, flags=re.DOTALL)
-    clean_text = re.sub(r"\[Your Name\]|\[Name\]|\[Your Title\]|Peek Pro", "", clean_text, flags=re.IGNORECASE)
+    clean_text = re.sub(r"\[Your Name\]|\[Name\]|\[Your Title\]|\[Peek Pro\]|\[Company Name\]", "", clean_text, flags=re.IGNORECASE)
 
     return {
         "text": clean_text.strip(),
@@ -511,7 +681,7 @@ elif input_method == "💬 Raw Text":
         raw_transcript_input = st.text_area(
             "Raw Message / Transcript",
             value="",
-            placeholder="Example:\nFrom: Mike Ramirez <mike@miamijetski.com>\nSubject: Switching off FareHarbor\n\nHey team, we run Miami JetSki Rentals across 5 locations in South Florida doing ~$2.5M annually. Currently on FareHarbor but our local reps complain about mobile checkout slowness. Need to switch over before Memorial Day. Can someone call me tomorrow?",
+            placeholder="Example:\nFrom: Brian Chesky <brian@airbnb.com>\nSubject: Exploring Peek Pro POS\n\nHi Peek team, I am looking to integrate new booking management software for our experiences division doing $4M+ annual volume. Need to connect with someone this week.",
             height=180
         )
         if st.form_submit_button("Queue Raw Transcript Lead"):
@@ -535,17 +705,16 @@ elif input_method == "📁 Batch Upload":
     if uploaded_file:
         try:
             if uploaded_file.name.endswith('.csv'):
-                # Bulletproof CSV parser for dirty lists
+                import csv
+                import io
                 content = uploaded_file.read().decode('utf-8', errors='ignore')
                 reader = csv.reader(io.StringIO(content))
                 data = list(reader)
 
                 if data:
                     header = data[0]
-                    # Find the maximum number of columns in any row
                     max_cols = max(len(row) for row in data)
 
-                    # If some rows have more columns than the header, pad the header dynamically
                     if max_cols > len(header):
                         header.extend([f"Unnamed_{i}" for i in range(len(header), max_cols)])
 
@@ -558,7 +727,7 @@ elif input_method == "📁 Batch Upload":
             st.info(f"Loaded {len(raw_df)} raw rows. Normalizing headers...")
             cleaned_leads = [normalize_csv_row(row.to_dict()) for _, row in raw_df.iterrows()]
 
-            st.dataframe(pd.DataFrame(cleaned_leads), use_container_width=True)
+            st.dataframe(pd.DataFrame(cleaned_leads), width="stretch")
 
             if st.button(f"➕ Add {len(cleaned_leads)} Leads to Queue"):
                 st.session_state["lead_queue"].extend(cleaned_leads)
@@ -574,11 +743,19 @@ st.divider()
 # ── Execution Trigger ─────────────────────────────────────────────────────────
 if st.button("🚀 Run 2-Stage AI Triage Pipeline", type="primary", disabled=len(st.session_state["lead_queue"]) == 0):
 
-    if not openai_key:
-        st.error("⚠️ OpenAI API Key is missing! Please enter it in the sidebar.")
+    # Flush stale UI widget keys so dropdowns default clean
+    for key in list(st.session_state.keys()):
+        if key.startswith("route_override_") or key.startswith("draft_edit_") or key.startswith("notes_"):
+            del st.session_state[key]
+
+    clean_openai_key = sanitize_api_key(openai_key)
+    clean_apollo_key = sanitize_api_key(apollo_key)
+
+    if not clean_openai_key:
+        st.error("⚠️ OpenAI API Key is missing or invalid! Please enter a valid key in the sidebar.")
         st.stop()
 
-    client = OpenAI(api_key=openai_key)
+    client = OpenAI(api_key=clean_openai_key)
     results = []
 
     progress_bar = st.progress(0)
@@ -587,50 +764,99 @@ if st.button("🚀 Run 2-Stage AI Triage Pipeline", type="primary", disabled=len
     for idx, raw_lead in enumerate(st.session_state["lead_queue"]):
         lead_payload = dict(raw_lead)
 
-        apollo_status_msg = "Skipped (Auto-Rules)"
-        if apollo_key and should_enrich_lead(lead_payload):
-            enrichment = enrich_with_apollo(lead_payload.get("email", ""), lead_payload.get("company", ""), apollo_key)
-            if enrichment:
-                lead_payload["apollo_enrichment"] = enrichment
-                apollo_status_msg = "Enriched Successfully"
-            else:
-                apollo_status_msg = "Attempted (No Org Match Found)"
-        elif not apollo_key:
-            apollo_status_msg = "No API Key Provided"
+        raw_text_to_check = lead_payload.get("raw_transcript", "") or lead_payload.get("notes", "") or lead_payload.get("company", "")
+        is_gibberish, gib_reason = is_gibberish_or_code(raw_text_to_check)
 
-        stage1_res = run_stage_1_scoring(client, lead_payload)
-
-        priority = stage1_res.get("priority", "Low")
-        rec_step = stage1_res.get("recommended_next_step", "")
-
-        variation = random.choice(["A", "B"])
-
-        # Hardcoded Routing Engine based on Priority
-        if rec_step == "Disqualify":
+        if is_gibberish:
+            stage1_res = {
+                "fit_score": 1,
+                "priority": "Low",
+                "persona": "Unknown",
+                "persona_rationale": "Raw input detected as invalid spam, script injection, or keyboard mashing.",
+                "icp_signals": {
+                    "industry_fit": "Weak", "business_model": "Weak", "company_size": "Weak",
+                    "pain_indicators": "Weak", "booking_method": "Weak", "growth_signals": "Weak",
+                    "geo_market": "Weak", "multi_channel": "Weak", "tech_readiness": "Weak"
+                },
+                "buying_signals": [],
+                "missing_info": ["valid lead info", "company details", "buying intent"],
+                "green_flags": [],
+                "red_flags": [f"🚨 {gib_reason}", "Zero buying intent"],
+                "recommended_next_step": "Disqualify",
+                "explanation": f"Lead automatically disqualified at Layer 0 pre-filter ($0 AI cost): {gib_reason}."
+            }
             draft = "Thank you for reaching out to Peek Pro. Based on your current setup, our platform is not a fit at this time."
-            draft_source = "Hardcoded Disqualification"
+            draft_source = "Layer 0 Auto-Disqualify ($0)"
             draft_tokens = 0
-
-        elif priority == "High" and rec_step in ["Sales", "Self-serve / PLG", "Nurture", "Needs More Information"]:
-            draft_response = run_stage_2_drafting(client, lead_payload, stage1_res, "gpt-4o", variation, session_bias)
-            draft = draft_response["text"]
-            draft_tokens = draft_response["tokens"]
-            draft_source = "AI Drafted (gpt-4o)"
-
-        elif priority == "Medium" and rec_step in ["Sales", "Self-serve / PLG", "Nurture", "Needs More Information"]:
-            draft_response = run_stage_2_drafting(client, lead_payload, stage1_res, "gpt-4o-mini", variation, session_bias)
-            draft = draft_response["text"]
-            draft_tokens = draft_response["tokens"]
-            draft_source = "AI Drafted (gpt-4o-mini)"
+            apollo_status_msg = "Skipped (Spam / Code Input)"
+            variation = "N/A"
+            rec_step = "Disqualify"
 
         else:
-            fname = lead_payload.get('first_name') or lead_payload.get('name', 'there')
-            if variation == "A":
-                draft = f"Hi {fname},\n\nThanks for reaching out! To help route you to the right team, could you share a bit more about your typical monthly booking volume?"
+            # 1. RUN AI EXTRACTION FIRST
+            stage1_res = run_stage_1_scoring(client, lead_payload)
+
+            # 2. AUTO-BACKFILL EXTRACTED FIELDS BEFORE CALLING APOLLO
+            for field, target_key in [
+                ("extracted_first_name", "first_name"),
+                ("extracted_last_name", "last_name"),
+                ("extracted_email", "email"),
+                ("extracted_company", "company"),
+                ("extracted_annual_sales_volume", "annual_sales_volume"),
+                ("extracted_job_title", "title"),
+                ("extracted_competitor", "competitor_software")
+            ]:
+                extracted_val = stage1_res.get(field)
+                if extracted_val and str(extracted_val).lower() not in ["null", "none", "unknown", "n/a", ""]:
+                    if not lead_payload.get(target_key):
+                        lead_payload[target_key] = str(extracted_val).strip()
+
+            if "first_name" in lead_payload and "last_name" in lead_payload and "name" not in lead_payload:
+                lead_payload["name"] = f"{lead_payload['first_name']} {lead_payload['last_name']}".strip()
+
+            # 3. CALL APOLLO WITH X-API-KEY HEADER
+            apollo_status_msg = "Skipped (Auto-Rules)"
+            if clean_apollo_key and should_enrich_lead(lead_payload):
+                enrichment = enrich_with_apollo(lead_payload.get("email", ""), lead_payload.get("company", ""), clean_apollo_key)
+                if enrichment:
+                    lead_payload["apollo_enrichment"] = enrichment
+                    apollo_status_msg = "Enriched Successfully"
+                else:
+                    apollo_status_msg = "Attempted (No Org Match Found)"
+            elif not clean_apollo_key:
+                apollo_status_msg = "No API Key Provided"
+
+            # 4. CONTINUE WITH ROUTING & DRAFTING
+            priority = stage1_res.get("priority", "Low")
+            rec_step = stage1_res.get("recommended_next_step", "Disqualify")
+
+            variation = random.choice(["A", "B"])
+
+            if rec_step == "Disqualify":
+                draft = "Thank you for reaching out to Peek Pro. Based on your current setup, our platform is not a fit at this time."
+                draft_source = "Hardcoded Disqualification"
+                draft_tokens = 0
+
+            elif priority == "High" and rec_step in ["Sales", "Self-serve / PLG", "Nurture", "Needs More Information"]:
+                draft_response = run_stage_2_drafting(client, lead_payload, stage1_res, "gpt-4o", variation, session_bias)
+                draft = draft_response["text"]
+                draft_tokens = draft_response["tokens"]
+                draft_source = "AI Drafted (gpt-4o)"
+
+            elif priority == "Medium" and rec_step in ["Sales", "Self-serve / PLG", "Nurture", "Needs More Information"]:
+                draft_response = run_stage_2_drafting(client, lead_payload, stage1_res, "gpt-4o-mini", variation, session_bias)
+                draft = draft_response["text"]
+                draft_tokens = draft_response["tokens"]
+                draft_source = "AI Drafted (gpt-4o-mini)"
+
             else:
-                draft = f"Hi {fname},\n\nThanks for your interest in Peek Pro! We'd love to learn more about your setup. Are you currently using a booking system?"
-            draft_source = "Hardcoded Template ($0)"
-            draft_tokens = 0
+                fname = lead_payload.get('first_name') or lead_payload.get('name', 'there')
+                if variation == "A":
+                    draft = f"Hi {fname},\n\nThanks for reaching out! To help route you to the right team, could you share a bit more about your typical monthly booking volume?"
+                else:
+                    draft = f"Hi {fname},\n\nThanks for your interest in Peek Pro! We'd love to learn more about your setup. Are you currently using a booking system?"
+                draft_source = "Hardcoded Template ($0)"
+                draft_tokens = 0
 
         results.append({
             "lead": lead_payload,
@@ -651,6 +877,8 @@ if st.button("🚀 Run 2-Stage AI Triage Pipeline", type="primary", disabled=len
 
     st.session_state["triage_results"] = results
     st.session_state["lead_queue"] = [] 
+
+    save_session_backup(results)
 
     st.session_state["flash_success"] = f"Successfully triaged {len(results)} lead(s)!"
     st.rerun()
@@ -692,13 +920,27 @@ if "triage_results" in st.session_state:
             st.markdown(f"### {status_prefix} Lead #{idx+1}: {display_name} | Priority: :{priority_color}[{priority}] | Persona: {persona}")
             st.markdown(f"**Suggested next step:** {s1.get('recommended_next_step', 'N/A')}")
 
-            # Removed st.form to allow dynamic UI updates when routing is overridden
             col_info, col_grid = st.columns([3, 1])
 
             with col_info:
                 st.markdown(f"**Persona Rationale:** {s1.get('persona_rationale', '')}")
                 st.markdown(f"**AI Explanation:** {s1.get('explanation', '')}")
-                st.markdown(f"**Buying Signals:** {', '.join(s1.get('buying_signals', []))}")
+
+                if s1.get('buying_signals'):
+                    st.markdown(f"**Buying Signals:** {', '.join(s1.get('buying_signals', []))}")
+
+                c_flags1, c_flags2 = st.columns(2)
+                with c_flags1:
+                    if s1.get("green_flags"):
+                        st.markdown("**🟢 Green Flags:**")
+                        for flag in s1.get("green_flags", []):
+                            st.caption(f"✅ {flag}")
+                with c_flags2:
+                    if s1.get("red_flags"):
+                        st.markdown("**🚩 Red Flags:**")
+                        for flag in s1.get("red_flags", []):
+                            st.caption(f"🚨 {flag}")
+
                 if s1.get("missing_info"):
                     st.warning(f"Missing Info: {', '.join(s1.get('missing_info'))}")
 
@@ -712,43 +954,23 @@ if "triage_results" in st.session_state:
                 c_step, c_notes = st.columns([1, 2])
                 current_route = item["final_next_step"]
 
-                new_step = c_step.selectbox(
+                route_options = ["Sales", "Self-serve / PLG", "Nurture", "Customer Support", "Disqualify", "Needs More Information"]
+                default_route_idx = route_options.index(current_route) if current_route in route_options else 4
+
+                c_step.selectbox(
                     "Override Next Step:",
-                    ["Sales", "Self-serve / PLG", "Nurture", "Customer Support", "Disqualify", "Needs More Information"],
-                    index=["Sales", "Self-serve / PLG", "Nurture", "Customer Support", "Disqualify", "Needs More Information"].index(current_route),
-                    key=f"route_override_{idx}"
+                    route_options,
+                    index=default_route_idx,
+                    key=f"route_override_{idx}",
+                    on_change=update_route_template,
+                    args=(idx,)
                 )
 
-                # Instantly overwrite the text area with a hardcoded template if the SDR changes the route
-                if new_step != current_route:
-                    item["final_next_step"] = new_step
-                    fname = lead.get('first_name', lead.get('name', 'there'))
-
-                    if new_step == "Disqualify":
-                        new_template = "Thank you for reaching out to Peek Pro. Based on your current setup, our platform is not a fit at this time."
-                    elif new_step == "Self-serve / PLG":
-                        new_template = f"Hi {fname},\n\nThanks for your interest! The best way to explore Peek Pro is to sign up for our self-serve platform directly on our website."
-                    elif new_step == "Nurture":
-                        new_template = f"Hi {fname},\n\nThanks for reaching out! We'd love to stay in touch and keep you updated with the latest news and features from Peek Pro as you grow."
-                    elif new_step == "Customer Support":
-                        new_template = f"Hi {fname},\n\nI've routed your message to our technical support team. They will be in touch shortly to assist you."
-                    elif new_step == "Needs More Information":
-                        new_template = f"Hi {fname},\n\nThanks for reaching out! To help route you to the right team, could you share a bit more about your typical monthly booking volume?"
-                    elif new_step == "Sales":
-                        new_template = f"Hi {fname},\n\nThanks for your interest in Peek Pro! We'd love to learn more about your setup. When is a good time to connect next week?"
-
-                    item["final_draft"] = new_template
-                    st.session_state[f"draft_edit_{idx}"] = new_template
-                    st.rerun()
-
-                # Text Area logic
-                # Ensure the text area respects the session state if we programmatically updated it above
                 if f"draft_edit_{idx}" not in st.session_state:
                     st.session_state[f"draft_edit_{idx}"] = item["final_draft"]
 
                 new_draft = st.text_area("Outreach Email Draft (Editable):", key=f"draft_edit_{idx}", height=220)
 
-                # Update reviewer notes
                 if f"notes_{idx}" not in st.session_state:
                     st.session_state[f"notes_{idx}"] = item["reviewer_notes"]
                 rev_notes = c_notes.text_input("Reviewer Notes:", key=f"notes_{idx}", placeholder="e.g. 'Changed tone to be more casual'")
@@ -773,29 +995,27 @@ if "triage_results" in st.session_state:
 
             st.divider()
 
-            # Use columns to make the buttons massive (use_container_width=True spans the whole column)
             btn_app, btn_rej = st.columns(2)
 
-            # Using type="primary" makes it inherit the green CSS we added at the top
-            if btn_app.button("✅ Approve", type="primary", use_container_width=True, key=f"btn_approve_{idx}"):
-                item["final_next_step"] = new_step
+            if btn_app.button("✅ Approve", type="primary", width="stretch", key=f"btn_approve_{idx}"):
+                item["final_next_step"] = st.session_state[f"route_override_{idx}"]
                 item["final_draft"] = new_draft
                 item["reviewer_notes"] = rev_notes
 
-                # Auto-detect human edits and save to learning loop
-                if new_draft.strip() != item["draft"].strip() or new_step != item["stage1"].get("recommended_next_step"):
+                if new_draft.strip() != item["draft"].strip() or item["final_next_step"] != item["stage1"].get("recommended_next_step"):
                     item["human_edited"] = True
-                    item["review_status"] = "APPROVED_WITH_EDITS" # 🟡 This brings back the yellow title!
-                    save_correction(persona, new_step, str(lead), rev_notes, item["draft"], new_draft)
+                    item["review_status"] = "APPROVED_WITH_EDITS"
+                    save_correction(persona, item["final_next_step"], str(lead), rev_notes, item["draft"], new_draft)
                 else:
                     item["human_edited"] = False
                     item["review_status"] = "APPROVED"
 
+                save_session_backup(results_list)
                 st.rerun()
 
-            # Leaving this as default styling keeps it neutral/gray, balancing the layout visually
-            if btn_rej.button("🗑️ Delete (Spam / Test / Error)", use_container_width=True, key=f"btn_reject_{idx}"):
+            if btn_rej.button("🗑️ Delete (Spam / Test / Error)", width="stretch", key=f"btn_reject_{idx}"):
                 item["review_status"] = "DELETED"
+                save_session_backup(results_list)
                 st.rerun()
 
     st.divider()
@@ -807,12 +1027,16 @@ if "triage_results" in st.session_state:
 
     export_rows = []
     for r in results_list:
+        lead = r["lead"]
+        fname = lead.get("first_name") or (lead.get("name", "").split()[0] if lead.get("name") else "N/A")
+        lname = lead.get("last_name") or (" ".join(lead.get("name", "").split()[1:]) if len(lead.get("name", "").split()) > 1 else "N/A")
+
         export_rows.append({
-            "First Name": r["lead"].get("first_name", "N/A"),
-            "Last Name": r["lead"].get("last_name", "N/A"),
-            "Email": r["lead"].get("email", "N/A"),
-            "Company": r["lead"].get("company", "N/A"),
-            "Sales Volume Tier": r["lead"].get("annual_sales_volume", "N/A"),
+            "First Name": fname,
+            "Last Name": lname,
+            "Email": lead.get("email", "N/A"),
+            "Company": lead.get("company", "N/A"),
+            "Sales Volume Tier": lead.get("annual_sales_volume", "N/A"),
             "Priority": r["stage1"].get("priority"),
             "Persona": r["stage1"].get("persona"),
             "A/B Variation Tested": r["variation"],
@@ -829,7 +1053,6 @@ if "triage_results" in st.session_state:
     export_df = pd.DataFrame(export_rows)
     approved_df = export_df[export_df["Review Status"].str.startswith("APPROVED")]
 
-    # Append datetime to filename
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     col_dl1, col_dl2 = st.columns(2)
@@ -839,7 +1062,7 @@ if "triage_results" in st.session_state:
         file_name=f"approved_leads_{timestamp}.csv",
         mime="text/csv",
         type="primary",
-        use_container_width=True
+        width="stretch"
     )
 
     col_dl2.download_button(
@@ -848,7 +1071,7 @@ if "triage_results" in st.session_state:
         file_name=f"all_triage_results_{timestamp}.csv",
         mime="text/csv",
         type="secondary",
-        use_container_width=True,
+        width="stretch",
         disabled=not all_processed
     )
 

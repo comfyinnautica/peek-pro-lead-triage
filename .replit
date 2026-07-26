@@ -1,1 +1,14 @@
+run = "streamlit run app.py --server.port 5000 --server.address 0.0.0.0"
+
 modules = ["python-3.11"]
+
+[userenv]
+
+[userenv.shared]
+
+[nix]
+packages = ["glibcLocales", "killall"]
+
+[[ports]]
+localPort = 5000
+externalPort = 80

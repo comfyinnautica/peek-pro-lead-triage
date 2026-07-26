@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+corrections.jsonl
+*.csv
+*.xlsx
+.DS_Store

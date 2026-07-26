@@ -1,0 +1,11 @@
+contact_name,mail,organization,title,location,sales_tier,current_software,message
+Bruce Wayne,bruce@gothamtours.com,Gotham City Tours,Billionaire,United States,More than $4m,FareHarbor,We have an unlimited budget. Need the best ticketing system for our bat cave tours. Launching immediately.
+Clark Kent,clark@dailyplanet.com,Daily Planet News,Reporter,United States,"less than $50,000",None,"Writing a story about tourism software. Can I interview your CEO?"
+Diana Prince,diana@amazonianretreats.com,Amazonian Retreats,Warrior Princess,Greece,"$150,000 to $1,500,000",Xola,"CHAT TRANSCRIPT: Visitor: Hi. Agent: Hello! How can I help? Visitor: I need a new booking system. Agent: Great, what are you using now? Visitor: Xola. It is too slow. Agent: What is your volume? Visitor: About 500k a year."
+Arthur Curry,arthur@atlantisdives.com,Atlantis Scuba,GM,Ocean,"$1,500,000 to $4m",Anchor,Staff scheduling is a mess with our 50 dive instructors.
+Barry Allen,barry@speedsters.com,Speedster Deliveries,Delivery Driver,United States,"$50,000 to $150,000",,"We deliver packages fast. Do you have routing software?"
+Victor Stone,victor@cyborgtech.com,Cyborg Tech,IT Lead,United States,More than $4m,FareHarbor,API docs please. We need to build a custom frontend for our museum client.
+Hal Jordan,hal@greenlanternflights.com,Green Lantern Flights,Pilot,United States,New business / less than 1 year of sales,Paper / Pen,Just starting out. Need a cheap way to take bookings.
+Oliver Queen,oliver@starcityarchery.com,Star City Archery,Mayor,United States,"$150,000 to $1,500,000",Resmark,Need better conversion rates on our mobile site.
+Dinah Lance,dinah@birdsofprey.com,Birds of Prey Music,Singer,United States,"less than $50,000",Ticketmaster,Looking for a platform to sell concert tickets for my band.
+John Constantine,john@magicshows.co.uk,Dark Arts Magic,Illusionist,United Kingdom,"$50,000 to $150,000",FareHarbor,"Urgent: need to switch systems this week. High fees are killing my margins."

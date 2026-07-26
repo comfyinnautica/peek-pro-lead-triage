@@ -8,3 +8,6 @@ corrections.jsonl
 *.csv
 *.xlsx
 .DS_Store
+!Test_Dataset1_Messy.csv
+!Test_Dataset2_Standard.csv
+!Test_Dataset3_Ambiguous.csv

@@ -6,7 +6,7 @@ An AI-powered Revenue Operations (RevOps) lead scoring, A/B testing outreach, co
 
 ## 🌟 Overview & System Architecture
 
-This application automates inbound lead qualification and outreach drafting using a **Two-Stage AI Pipeline** with deterministic safety guardrails:
+This application automates inbound lead qualification and outreach drafting using a Two-Stage AI Pipeline with safety guardrails:
 
 1. **Ingestion & Normalization (Layer 1):** Ingests leads via Web Form, Raw Text/Chat transcripts, or CSV/Excel upload. A zero-token deterministic normalizer standardizes column headers and sanitizes text inputs.
 2. **Conditional Data Enrichment (Apollo.io):** Automatically evaluates leads against volume and intent guardrails. If a lead qualifies, the system calls the Apollo API to enrich the payload with firmographic data (estimated revenue, employee count, industry, location) before AI evaluation, reducing hallucinations and filling data gaps.
@@ -27,7 +27,7 @@ This application automates inbound lead qualification and outreach drafting usin
 ### Installation
 
 1. **Clone the repository:**
-   git clone https://github.com/your-username/peek-pro-lead-triage.git
+   git clone https://github.com/comfyinnautica/peek-pro-lead-triage.git
    cd peek-pro-lead-triage
 
 2. **Set up a virtual environment:**

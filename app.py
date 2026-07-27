@@ -281,7 +281,7 @@ def enrich_with_apollo(email: str, company: str, api_key: str) -> dict:
     headers = {
         "Cache-Control": "no-cache",
         "Content-Type": "application/json",
-        "X-Api-Key": clean_key  # 👈 Fixed: Passed as Header (Apollo Requirement)
+        "X-Api-Key": clean_key  # Passed as Header for Apollo API spec
     }
 
     payload = {}
@@ -315,17 +315,18 @@ with st.sidebar:
     raw_env_apollo = os.environ.get("APOLLO_API_KEY", "")
 
     with st.expander("🔑 API Keys & Integrations", expanded=False):
-        openai_key = st.text_input(
-            "OpenAI API Key",
+        # BYOK Security Fix: Value is left blank so server keys are never exposed in the browser DOM
+        ui_openai_key = st.text_input(
+            "OpenAI API Key Override (Optional)",
             type="password",
-            value=sanitize_api_key(raw_env_openai),
-            help="Paste your OpenAI API key here. Required for AI triage.",
+            value="",
+            help="Leave blank to use the system default server key.",
         )
-        apollo_key = st.text_input(
-            "Apollo API Key (Optional)",
+        ui_apollo_key = st.text_input(
+            "Apollo API Key Override (Optional)",
             type="password",
-            value=sanitize_api_key(raw_env_apollo),
-            help="Enables smart tie-breaker enrichment for leads.",
+            value="",
+            help="Leave blank to use the system default server key.",
         )
 
     st.divider()
@@ -748,8 +749,9 @@ if st.button("🚀 Run 2-Stage AI Triage Pipeline", type="primary", disabled=len
         if key.startswith("route_override_") or key.startswith("draft_edit_") or key.startswith("notes_"):
             del st.session_state[key]
 
-    clean_openai_key = sanitize_api_key(openai_key)
-    clean_apollo_key = sanitize_api_key(apollo_key)
+    # Prefer UI override key; fallback securely to server environment variable
+    clean_openai_key = sanitize_api_key(ui_openai_key) or sanitize_api_key(raw_env_openai)
+    clean_apollo_key = sanitize_api_key(ui_apollo_key) or sanitize_api_key(raw_env_apollo)
 
     if not clean_openai_key:
         st.error("⚠️ OpenAI API Key is missing or invalid! Please enter a valid key in the sidebar.")

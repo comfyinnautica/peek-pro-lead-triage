@@ -281,7 +281,7 @@ def enrich_with_apollo(email: str, company: str, api_key: str) -> dict:
     headers = {
         "Cache-Control": "no-cache",
         "Content-Type": "application/json",
-        "X-Api-Key": clean_key  # Passed as Header for Apollo API spec
+        "X-Api-Key": clean_key
     }
 
     payload = {}
@@ -315,7 +315,6 @@ with st.sidebar:
     raw_env_apollo = os.environ.get("APOLLO_API_KEY", "")
 
     with st.expander("🔑 API Keys & Integrations", expanded=False):
-        # BYOK Security Fix: Value is left blank so server keys are never exposed in the browser DOM
         ui_openai_key = st.text_input(
             "OpenAI API Key Override (Optional)",
             type="password",
@@ -474,6 +473,7 @@ STRICT GROUND TRUTH & EXTRACTION RULES:
   * "extracted_job_title": Title string or null
   * "extracted_competitor": Software/POS name mentioned (e.g. Anchor, FareHarbor, Xola) or null
 
+- GEO MARKET SIGNAL (CRITICAL): Check lead fields, notes, AND "apollo_enrichment" location data. If a location is present anywhere in the payload (e.g., 'Colorado', 'United States', or city/state info in enrichment), you MUST rate "geo_market" as "Strong" (or "Moderate"). Do NOT leave "geo_market" as "Unknown" if location information or enrichment data is present.
 - GENERAL RULE: Err on the safe side. It is preferable to assign "Unknown" to missing information. Never assume or infer; deduce only from facts.
 - INDUSTRY EXCLUSION RULE (CRITICAL): Peek Pro is ONLY for Tour, Activity, Rental, Museum, and Experience operators. If the notes, company name, or enrichment data indicate they sell physical goods (e.g., paper, printers, retail, ecommerce), B2B services, software, or are otherwise entirely outside the experiences industry, you MUST score them low and route to "Disqualify", regardless of how high their revenue or job title is. Industry fit is absolute.
 - INTENT OVERRIDE RULE (CRITICAL): If the `notes` or transcript clearly indicate they are a reporter, student, or vendor NOT looking to buy, route to "Disqualify". HOWEVER, do NOT disqualify based solely on an unusual job title (e.g., "Mayor", "Illusionist") if they express clear intent for booking software, mention conversion issues, or name a competitor. Intent trumps unusual titles.
@@ -749,7 +749,6 @@ if st.button("🚀 Run 2-Stage AI Triage Pipeline", type="primary", disabled=len
         if key.startswith("route_override_") or key.startswith("draft_edit_") or key.startswith("notes_"):
             del st.session_state[key]
 
-    # Prefer UI override key; fallback securely to server environment variable
     clean_openai_key = sanitize_api_key(ui_openai_key) or sanitize_api_key(raw_env_openai)
     clean_apollo_key = sanitize_api_key(ui_apollo_key) or sanitize_api_key(raw_env_apollo)
 
@@ -795,10 +794,28 @@ if st.button("🚀 Run 2-Stage AI Triage Pipeline", type="primary", disabled=len
             rec_step = "Disqualify"
 
         else:
-            # 1. RUN AI EXTRACTION FIRST
+            # ⚡ 1. REGEX PRE-PARSER: Extract email & company immediately from raw text before calling Apollo
+            if not lead_payload.get("email") and raw_text_to_check:
+                email_match = re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', raw_text_to_check)
+                if email_match:
+                    lead_payload["email"] = email_match.group(0).strip()
+
+            # ⚡ 2. ENRICH WITH APOLLO FIRST (So Stage 1 AI can see the enriched location!)
+            apollo_status_msg = "Skipped (Auto-Rules)"
+            if clean_apollo_key and should_enrich_lead(lead_payload):
+                enrichment = enrich_with_apollo(lead_payload.get("email", ""), lead_payload.get("company", ""), clean_apollo_key)
+                if enrichment:
+                    lead_payload["apollo_enrichment"] = enrichment
+                    apollo_status_msg = "Enriched Successfully"
+                else:
+                    apollo_status_msg = "Attempted (No Org Match Found)"
+            elif not clean_apollo_key:
+                apollo_status_msg = "No API Key Provided"
+
+            # ⚡ 3. RUN STAGE 1 SCORING WITH APOLLO DATA ALREADY INCLUDED
             stage1_res = run_stage_1_scoring(client, lead_payload)
 
-            # 2. AUTO-BACKFILL EXTRACTED FIELDS BEFORE CALLING APOLLO
+            # 4. AUTO-BACKFILL ANY REMAINING EXTRACTED FIELDS
             for field, target_key in [
                 ("extracted_first_name", "first_name"),
                 ("extracted_last_name", "last_name"),
@@ -816,19 +833,7 @@ if st.button("🚀 Run 2-Stage AI Triage Pipeline", type="primary", disabled=len
             if "first_name" in lead_payload and "last_name" in lead_payload and "name" not in lead_payload:
                 lead_payload["name"] = f"{lead_payload['first_name']} {lead_payload['last_name']}".strip()
 
-            # 3. CALL APOLLO WITH X-API-KEY HEADER
-            apollo_status_msg = "Skipped (Auto-Rules)"
-            if clean_apollo_key and should_enrich_lead(lead_payload):
-                enrichment = enrich_with_apollo(lead_payload.get("email", ""), lead_payload.get("company", ""), clean_apollo_key)
-                if enrichment:
-                    lead_payload["apollo_enrichment"] = enrichment
-                    apollo_status_msg = "Enriched Successfully"
-                else:
-                    apollo_status_msg = "Attempted (No Org Match Found)"
-            elif not clean_apollo_key:
-                apollo_status_msg = "No API Key Provided"
-
-            # 4. CONTINUE WITH ROUTING & DRAFTING
+            # 5. CONTINUE WITH ROUTING & DRAFTING
             priority = stage1_res.get("priority", "Low")
             rec_step = stage1_res.get("recommended_next_step", "Disqualify")
 
